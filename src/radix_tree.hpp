@@ -69,9 +69,13 @@ struct node
     bool operator== (node other) const;
     bool operator!= (node other) const;
 
+    inline bool has_refcount ();
+    inline void set_refcount_bit ();
+    inline void clear_refcount_bit ();
+    inline unsigned char *refcount_ptr ();
     inline uint32_t refcount ();
     inline uint32_t prefix_length ();
-    inline uint32_t edgecount ();
+    inline uint8_t edgecount ();
     inline unsigned char *prefix ();
     inline unsigned char *first_bytes ();
     inline unsigned char first_byte_at (size_t i);
@@ -79,14 +83,14 @@ struct node
     inline node node_at (size_t i);
     inline void set_refcount (uint32_t value);
     inline void set_prefix_length (uint32_t value);
-    inline void set_edgecount (uint32_t value);
+    inline void set_edgecount (uint8_t value);
     inline void set_prefix (const unsigned char *prefix);
     inline void set_first_bytes (const unsigned char *bytes);
     inline void set_first_byte_at (size_t i, unsigned char byte);
     inline void set_node_ptrs (unsigned char const *ptrs);
     inline void set_node_at (size_t i, node n);
     inline void set_edge_at (size_t i, unsigned char byte, node n);
-    void resize (size_t prefix_length, size_t edgecount);
+    void resize (size_t refcount, size_t prefix_length, size_t edgecount);
 };
 
 node make_node (size_t refcount, size_t prefix_length, size_t nedges);

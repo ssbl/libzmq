@@ -40,45 +40,83 @@ node::node (unsigned char *data) : data_ (data)
 {
 }
 
+bool node::has_refcount ()
+{
+    uint32_t header;
+    memcpy (&header, data_, sizeof (header));
+    return header >> 31;
+}
+
+void node::set_refcount_bit ()
+{
+    uint32_t header;
+    memcpy (&header, data_, sizeof (header));
+    header |= (1ULL << 31);
+    memcpy (data_, &header, sizeof (header));
+}
+
+void node::clear_refcount_bit ()
+{
+    uint32_t header;
+    memcpy (&header, data_, sizeof (header));
+    header &= ~(1ULL << 31);
+    memcpy (data_, &header, sizeof (header));
+}
+
+// NOTE: prefix_length and edgecount need to be set before calling this
+// function!
+unsigned char *node::refcount_ptr ()
+{
+    return data_ + sizeof (uint32_t) + prefix_length ()
+           + (edgecount () * (1 + sizeof (void *)));
+}
+
 uint32_t node::refcount ()
 {
-    uint32_t u32;
-    memcpy (&u32, data_, sizeof (u32));
+    uint32_t u32 = 0;
+    if (has_refcount ())
+        memcpy (&u32, refcount_ptr (), sizeof (u32));
     return u32;
 }
 
 void node::set_refcount (uint32_t value)
 {
-    memcpy (data_, &value, sizeof (value));
+    memcpy (refcount_ptr (), &value, sizeof (value));
 }
 
 uint32_t node::prefix_length ()
 {
-    uint32_t u32;
-    memcpy (&u32, data_ + sizeof (uint32_t), sizeof (u32));
-    return u32;
+    uint32_t header;
+    memcpy (&header, data_, sizeof (header));
+    return (header & 0x7fffff00) >> 8;
 }
 
 void node::set_prefix_length (uint32_t value)
 {
-    memcpy (data_ + sizeof (value), &value, sizeof (value));
+    uint32_t header;
+    memcpy (&header, data_, sizeof (header));
+    header = (header & 0x800000ff) | ((value & 0x007fffff) << 8);
+    memcpy (data_, &header, sizeof (header));
 }
 
-uint32_t node::edgecount ()
+uint8_t node::edgecount ()
 {
-    uint32_t u32;
-    memcpy (&u32, data_ + 2 * sizeof (uint32_t), sizeof (u32));
-    return u32;
+    uint32_t header;
+    memcpy (&header, data_, sizeof (header));
+    return header & 0xff;
 }
 
-void node::set_edgecount (uint32_t value)
+void node::set_edgecount (uint8_t value)
 {
-    memcpy (data_ + 2 * sizeof (value), &value, sizeof (value));
+    uint32_t header;
+    memcpy (&header, data_, sizeof (header));
+    header = (header & 0xffffff00) | value;
+    memcpy (data_, &header, sizeof (header));
 }
 
 unsigned char *node::prefix ()
 {
-    return data_ + 3 * sizeof (uint32_t);
+    return data_ + sizeof (uint32_t);
 }
 
 void node::set_prefix (unsigned char const *bytes)
@@ -149,29 +187,43 @@ bool node::operator!= (node other) const
     return !(*this == other);
 }
 
-void node::resize (size_t prefix_length, size_t edgecount)
+void node::resize (size_t refcount, size_t prefix_length, size_t edgecount)
 {
     size_t sz =
-      3 * sizeof (uint32_t) + prefix_length + edgecount * (1 + sizeof (void *));
+      sizeof (uint32_t) + prefix_length + edgecount * (1 + sizeof (void *));
+    if (refcount > 0)
+        sz += sizeof (uint32_t);
     unsigned char *new_data =
       static_cast<unsigned char *> (realloc (data_, sz));
     zmq_assert (new_data);
     data_ = new_data;
     set_prefix_length (static_cast<uint32_t> (prefix_length));
-    set_edgecount (static_cast<uint32_t> (edgecount));
+    set_edgecount (static_cast<uint8_t> (edgecount));
+    if (refcount > 0) {
+        set_refcount (static_cast<uint32_t> (refcount));
+        set_refcount_bit ();
+    } else
+        clear_refcount_bit ();
 }
 
 node make_node (size_t refs, size_t bytes, size_t edges)
 {
-    size_t size = 3 * sizeof (uint32_t) + bytes + edges * (1 + sizeof (void *));
+    size_t size = sizeof (uint32_t) + bytes + edges * (1 + sizeof (void *));
+    if (refs > 0)
+        size += sizeof (uint32_t);
 
     unsigned char *data = static_cast<unsigned char *> (malloc (size));
     zmq_assert (data);
 
     node n (data);
-    n.set_refcount (static_cast<uint32_t> (refs));
     n.set_prefix_length (static_cast<uint32_t> (bytes));
-    n.set_edgecount (static_cast<uint32_t> (edges));
+    n.set_edgecount (static_cast<uint8_t> (edges));
+    if (refs > 0) {
+        n.set_refcount (static_cast<uint32_t> (refs));
+        n.set_refcount_bit ();
+    } else
+        n.clear_refcount_bit ();
+
     return n;
 }
 
@@ -179,6 +231,7 @@ node make_node (size_t refs, size_t bytes, size_t edges)
 
 zmq::radix_tree::radix_tree () : root_ (make_node (0, 0, 0)), size_ (0)
 {
+    printf ("%u\n", root_.prefix_length ());
 }
 
 static void free_nodes (node n)
@@ -233,7 +286,7 @@ match_result zmq::radix_tree::match (const unsigned char *key,
         // Even if a prefix of the key matches and we're doing a
         // lookup, this means we've found a matching subscription.
         if (check && j == current_node.prefix_length ()
-            && current_node.refcount () > 0) {
+            && current_node.has_refcount ()) {
             i = size;
             break;
         }
@@ -285,7 +338,8 @@ bool zmq::radix_tree::add (const unsigned char *key, size_t size)
             key_node.set_prefix (key + i);
 
             // Reallocate for one more edge.
-            current_node.resize (current_node.prefix_length (),
+            current_node.resize (current_node.refcount (),
+                                 current_node.prefix_length (),
                                  current_node.edgecount () + 1);
 
             // Make room for the new edge. We need to shift the chunk
@@ -335,8 +389,7 @@ bool zmq::radix_tree::add (const unsigned char *key, size_t size)
         // the matched characters and 2 outgoing edges to the above
         // nodes. Set the refcount to 0 since this node doesn't hold a
         // key.
-        current_node.resize (j, 2);
-        current_node.set_refcount (0);
+        current_node.resize (0, j, 2);
 
         // Add links to the new nodes. We don't need to copy the
         // prefix since resize() retains it in the current node.
@@ -365,14 +418,13 @@ bool zmq::radix_tree::add (const unsigned char *key, size_t size)
 
         // Resize the current node to hold only the matched characters
         // from its prefix and one edge to the new node.
-        current_node.resize (j, 1);
+        current_node.resize (1, j, 1);
 
         // Add an edge to the split node and set the refcount to 1
         // since this key wasn't inserted earlier. We don't need to
         // set the prefix because the first j bytes in the prefix are
         // preserved by resize().
         current_node.set_edge_at (0, split_node.prefix ()[0], split_node);
-        current_node.set_refcount (1);
 
         ++size_;
         parent_node.set_node_at (edge_idx, current_node);
@@ -383,8 +435,18 @@ bool zmq::radix_tree::add (const unsigned char *key, size_t size)
     zmq_assert (j == current_node.prefix_length ());
 
     ++size_;
+    if (!current_node.has_refcount ()) {
+        current_node.resize (1, current_node.prefix_length (),
+                             current_node.edgecount ());
+        if (j == 0)
+            root_.data_ = current_node.data_;
+        else
+            parent_node.set_node_at (edge_idx, current_node);
+        return true;
+    }
+
     current_node.set_refcount (current_node.refcount () + 1);
-    return current_node.refcount () == 1;
+    return false;
 }
 
 bool zmq::radix_tree::rm (const unsigned char *key, size_t size)
@@ -399,7 +461,7 @@ bool zmq::radix_tree::rm (const unsigned char *key, size_t size)
     node grandparent_node = result.grandparent_node;
 
     if (i != size || j != current_node.prefix_length ()
-        || current_node.refcount () == 0)
+        || !current_node.has_refcount ())
         return false;
 
     current_node.set_refcount (current_node.refcount () - 1);
@@ -408,14 +470,26 @@ bool zmq::radix_tree::rm (const unsigned char *key, size_t size)
         return false;
 
     // Don't delete the root node.
-    if (current_node == root_)
+    if (current_node == root_) {
+        // The root always has an empty prefix.
+        zmq_assert (current_node.prefix_length () == 0);
+
+        // This just trims away the last word, so moving the edges
+        // isn't necessary.
+        current_node.resize (0, 0, current_node.edgecount ());
+        root_.data_ = current_node.data_;
         return true;
+    }
 
     size_t outgoing_edges = current_node.edgecount ();
-    if (outgoing_edges > 1)
+    if (outgoing_edges > 1) {
         // This node can't be merged with any other node, so there's
         // nothing more to do.
+        current_node.resize (0, current_node.prefix_length (),
+                             current_node.edgecount ());
+        parent_node.set_node_at(edge_idx, current_node);
         return true;
+    }
 
     if (outgoing_edges == 1) {
         // Merge this node with the single child node.
@@ -425,7 +499,8 @@ bool zmq::radix_tree::rm (const unsigned char *key, size_t size)
         // keep the old prefix length since resize() will overwrite
         // it.
         uint32_t old_prefix_length = current_node.prefix_length ();
-        current_node.resize (old_prefix_length + child.prefix_length (),
+        current_node.resize (child.refcount (),
+                             old_prefix_length + child.prefix_length (),
                              child.edgecount ());
 
         // Append the child node's prefix to the current node.
@@ -435,14 +510,13 @@ bool zmq::radix_tree::rm (const unsigned char *key, size_t size)
         // Copy the rest of child node's data to the current node.
         current_node.set_first_bytes (child.first_bytes ());
         current_node.set_node_ptrs (child.node_ptrs ());
-        current_node.set_refcount (child.refcount ());
 
         free (child.data_);
         parent_node.set_node_at (edge_idx, current_node);
         return true;
     }
 
-    if (parent_node.edgecount () == 2 && parent_node.refcount () == 0
+    if (parent_node.edgecount () == 2 && !parent_node.has_refcount ()
         && parent_node != root_) {
         // Removing this node leaves the parent with one child.
         // If the parent doesn't hold a key or if it isn't the root,
@@ -454,7 +528,8 @@ bool zmq::radix_tree::rm (const unsigned char *key, size_t size)
         // keep the old prefix length since resize() will overwrite
         // it.
         uint32_t old_prefix_length = parent_node.prefix_length ();
-        parent_node.resize (old_prefix_length + other_child.prefix_length (),
+        parent_node.resize (other_child.refcount (),
+                            old_prefix_length + other_child.prefix_length (),
                             other_child.edgecount ());
 
         // Append the child node's prefix to the current node.
@@ -464,7 +539,6 @@ bool zmq::radix_tree::rm (const unsigned char *key, size_t size)
         // Copy the rest of child node's data to the current node.
         parent_node.set_first_bytes (other_child.first_bytes ());
         parent_node.set_node_ptrs (other_child.node_ptrs ());
-        parent_node.set_refcount (other_child.refcount ());
 
         free (current_node.data_);
         free (other_child.data_);
@@ -492,7 +566,7 @@ bool zmq::radix_tree::rm (const unsigned char *key, size_t size)
 
     // Shrink the parent node to the new size, which "deletes" the
     // last pointer in the chunk of node pointers.
-    parent_node.resize (parent_node.prefix_length (),
+    parent_node.resize (parent_node.refcount (), parent_node.prefix_length (),
                         parent_node.edgecount () - 1);
 
     // Nothing points to this node now, so we can reclaim it.
@@ -507,13 +581,13 @@ bool zmq::radix_tree::rm (const unsigned char *key, size_t size)
 
 bool zmq::radix_tree::check (const unsigned char *key, size_t size)
 {
-    if (root_.refcount () > 0)
+    if (root_.has_refcount ())
         return true;
 
     match_result result = match (key, size, true);
     return result.nkey == size
            && result.nprefix == result.current_node.prefix_length ()
-           && result.current_node.refcount () > 0;
+           && result.current_node.has_refcount ();
 }
 
 static void
@@ -533,7 +607,7 @@ visit_keys (node n,
 
     for (size_t i = 0; i < n.prefix_length (); ++i)
         (*buffer)[buffer_size++] = n.prefix ()[i];
-    if (n.refcount () > 0)
+    if (n.has_refcount ())
         func (*buffer, buffer_size, arg);
     for (size_t i = 0; i < n.edgecount (); ++i)
         visit_keys (n.node_at (i), buffer, buffer_size, maxbuffer_size, func,
